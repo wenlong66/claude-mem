@@ -16,6 +16,7 @@ import { readJsonSafe } from '../../utils/json-utils.js';
 import { readFlatSettings } from '../utils/settings.js';
 import { SettingsDefaultsManager } from '../../shared/SettingsDefaultsManager.js';
 import { USER_SETTINGS_PATH } from '../../shared/paths.js';
+import { writeJsonFileAtomic as writeSettingsJsonAtomic } from '../../shared/atomic-json.js';
 import { shutdownWorkerAndWait } from '../../services/install/shutdown-helper.js';
 import {
   normalizeRuntimeFlag,
@@ -56,7 +57,7 @@ function clearServerRuntimeSettings(keys: readonly string[]): void {
   }
   if (changed) {
     try {
-      writeFileSync(USER_SETTINGS_PATH, JSON.stringify(flat, null, 2), 'utf-8');
+      writeSettingsJsonAtomic(USER_SETTINGS_PATH, flat);
     } catch (error: unknown) {
       console.warn('[uninstall] Could not write settings during server runtime cleanup:', error instanceof Error ? error.message : String(error));
     }
@@ -355,10 +356,6 @@ export async function runUninstallCommand(): Promise<void> {
   ]);
 
   const ideCleanups: Array<{ label: string; fn: () => Promise<number> | number }> = [
-    { label: 'Gemini CLI hooks', fn: async () => {
-      const { uninstallGeminiCliHooks } = await import('../../services/integrations/GeminiCliHooksInstaller.js');
-      return uninstallGeminiCliHooks();
-    }},
     { label: 'Windsurf hooks', fn: async () => {
       const { uninstallWindsurfHooks } = await import('../../services/integrations/WindsurfHooksInstaller.js');
       return uninstallWindsurfHooks();
@@ -374,6 +371,10 @@ export async function runUninstallCommand(): Promise<void> {
     { label: 'Codex CLI', fn: async () => {
       const { uninstallCodexCli } = await import('../../services/integrations/CodexCliInstaller.js');
       return uninstallCodexCli();
+    }},
+    { label: 'Antigravity CLI hooks + MCP', fn: async () => {
+      const { uninstallAntigravityCliHooks } = await import('../../services/integrations/AntigravityCliHooksInstaller.js');
+      return uninstallAntigravityCliHooks();
     }},
   ];
 

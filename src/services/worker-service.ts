@@ -2,7 +2,7 @@
 import path from 'path';
 import { existsSync, readFileSync, unlinkSync, writeFileSync } from 'fs';
 import { spawn } from 'child_process';
-import { Database } from 'bun:sqlite';
+import type { Database } from 'bun:sqlite';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { getWorkerPort, getWorkerHost, fetchWithTimeout, resolveWorkerScriptPath } from '../shared/worker-utils.js';
@@ -16,6 +16,7 @@ import { getAuthMethodDescription } from '../shared/EnvManager.js';
 import { logger } from '../utils/logger.js';
 import { ChromaMcpManager } from './sync/ChromaMcpManager.js';
 import { ChromaSync } from './sync/ChromaSync.js';
+import { openConfiguredSqliteDatabase } from './sqlite/connection.js';
 import { configureSupervisorSignalHandlers, getSupervisor, startSupervisor } from '../supervisor/index.js';
 import { sanitizeEnv } from '../supervisor/env-sanitizer.js';
 
@@ -71,8 +72,8 @@ import {
   handleCursorCommand
 } from './integrations/CursorHooksInstaller.js';
 import {
-  handleGeminiCliCommand
-} from './integrations/GeminiCliHooksInstaller.js';
+  handleAntigravityCliCommand
+} from './integrations/AntigravityCliHooksInstaller.js';
 
 import { DatabaseManager } from './worker/DatabaseManager.js';
 import { SessionManager } from './worker/SessionManager.js';
@@ -892,7 +893,7 @@ function parseServerApiKeyOptions(args: string[]): Record<string, string> {
 
 function openServerCommandDatabase(): Database {
   ensureDir(DATA_DIR);
-  return new Database(DB_PATH, { create: true, readwrite: true });
+  return openConfiguredSqliteDatabase(DB_PATH, { create: true, readwrite: true });
 }
 
 function runServerApiKeyCli(args: string[]): never {
@@ -1230,10 +1231,10 @@ async function main() {
       break;
     }
 
-    case 'gemini-cli': {
-      const geminiSubcommand = process.argv[3];
-      const geminiResult = await handleGeminiCliCommand(geminiSubcommand, process.argv.slice(4));
-      process.exit(geminiResult);
+    case 'antigravity-cli': {
+      const antigravitySubcommand = process.argv[3];
+      const antigravityResult = await handleAntigravityCliCommand(antigravitySubcommand, process.argv.slice(4));
+      process.exit(antigravityResult);
       break;
     }
 
@@ -1247,7 +1248,7 @@ async function main() {
       const event = process.argv[4];
       if (!platform || !event) {
         console.error('Usage: claude-mem hook <platform> <event>');
-        console.error('Platforms: claude-code, codex, cursor, gemini-cli, raw');
+        console.error('Platforms: claude-code, codex, cursor, antigravity-cli, raw');
         console.error('Events: context, session-init, observation, summarize, user-message');
         process.exit(1);
       }
