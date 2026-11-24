@@ -4,23 +4,47 @@ on:
   push:
     tags:
       - 'v*'
+  # Tags created with GITHUB_TOKEN do not emit a new workflow-triggering
+  # push. The release-request workflow dispatches this same publisher on its tag.
+  workflow_dispatch:
+
+# npm trusted publishing (OIDC): no NPM_TOKEN secret. The package's trusted
+# publisher on npmjs.com names this repo and this workflow file.
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    concurrency:
+      group: npm-publish-${{ github.repository }}
+      queue: max
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
+          node-version: '24'
+          # No registry-url: setup-node would write an _authToken line to .npmrc,
+          # and npm would use that token auth instead of trusted publishing.
       - name: Install Bun (required by smoke:clean-room)
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.4.4
       - run: npm install --ignore-scripts
       - run: npm run build
       - run: npm run smoke:clean-room
-      - run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # Trusted publishing requires npm CLI 11.5.1 or later.
+      - run: npm install -g npm@^11.5.1
+      - name: Publish
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            state=$(node scripts/github-tagged-release.mjs publication-state)
+            if [[ "$state" == published ]]; then
+              echo "npm already serves the requested tag commit."
+              exit 0
+            fi
+          fi
+          npm publish

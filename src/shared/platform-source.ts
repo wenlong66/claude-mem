@@ -1,4 +1,6 @@
 export const DEFAULT_PLATFORM_SOURCE = 'claude';
+/** Grok Build runs the Claude Code plugin's hooks; its sessions are stored under this source (#6419). */
+export const GROK_BUILD_PLATFORM_SOURCE = 'grok-build';
 
 function sanitizeRawSource(value: string): string {
   return value.trim().toLowerCase().replace(/\s+/g, '-');
@@ -14,6 +16,10 @@ export function normalizePlatformSource(value?: string | null): string {
   if (source.includes('codex')) return 'codex';
   if (source.includes('cursor')) return 'cursor';
   if (source.includes('claude')) return 'claude';
+  if (source.includes('kimi')) return 'kimi';
+  if (source === 'pi-mono') return 'pi';
+  // Exact tokens only: a substring match on "agy" would catch unrelated names.
+  if (source === 'agy' || source === 'antigravity' || source.startsWith('antigravity-')) return 'antigravity-cli';
 
   return source;
 }
@@ -24,7 +30,7 @@ export function normalizePlatformSourceOrNull(value?: string | null): string | n
 }
 
 export function sortPlatformSources(sources: string[]): string[] {
-  const priority = ['claude', 'codex', 'cursor'];
+  const priority = ['claude', 'codex', 'antigravity-cli', 'cursor', 'kimi'];
 
   return [...sources].sort((a, b) => {
     const aPriority = priority.indexOf(a);

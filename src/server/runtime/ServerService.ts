@@ -9,6 +9,7 @@ import { fileURLToPath } from 'url';
 import { parseArgs } from 'util';
 import { Server, type RouteHandler } from '../../services/server/Server.js';
 import { paths } from '../../shared/paths.js';
+import { BUN_NO_AUTO_INSTALL_FLAG } from '../../shared/bun-auto-install.js';
 import { logger } from '../../utils/logger.js';
 import {
   captureProcessStartToken,
@@ -18,10 +19,12 @@ import {
 } from '../../supervisor/process-registry.js';
 import { sanitizeEnv } from '../../supervisor/env-sanitizer.js';
 import { killProcessTree } from '../../shared/kill-process-tree.js';
+import { getDefaultServerPort } from '../../shared/install-port.js';
 import { ServerV1PostgresRoutes } from '../routes/v1/ServerV1PostgresRoutes.js';
 import { SessionsObservationsAdapter } from '../compat/SessionsObservationsAdapter.js';
 import { SessionsSummarizeAdapter } from '../compat/SessionsSummarizeAdapter.js';
 import { ActiveServerQueueManager } from './ActiveServerQueueManager.js';
+import { getVectorSearchStatus } from '../services/ObservationEmbeddingService.js';
 import { ServerViewerRoutes } from './ServerViewerRoutes.js';
 import type { ServerServiceGraph, ServerQueueLaneMetric } from './types.js';
 
@@ -30,7 +33,6 @@ import type { ServerServiceGraph, ServerQueueLaneMetric } from './types.js';
 // back-compat. Plan §1d will handle the literal migration.
 const SERVER_RUNTIME = 'server-beta';
 const DEFAULT_SERVER_HOST = '127.0.0.1';
-const DEFAULT_SERVER_PORT = 37877;
 
 // `server stop` waits at least this long for the daemon to exit. Must exceed
 // runShutdownCascade's own budget (5s SIGTERM grace + 1s SIGKILL grace) so a
@@ -69,21 +71,51 @@ class ServerRuntimeInfoRoutes implements RouteHandler {
     // can read waiting/active/completed/failed/delayed/stalled without
     // hitting `/api/health`. Sampling is best-effort: a Redis blip surfaces
     // the lane with `unavailable: true` rather than crashing the route.
+    //
+    // It is unauthenticated on purpose (a probe cannot present credentials) and
+    // the server runtime is reachable over the container network
+    // (docker-compose sets CLAUDE_MEM_SERVER_HOST=0.0.0.0). So it reports the
+    // state the route documents and nothing else: the auth mode, the Postgres
+    // schema version, the queue backend's connection coordinates (host, port,
+    // key prefix) and the raw driver error text were reconnaissance for anyone
+    // who could reach the port, and a probe reads the lanes without them.
+    // `vectorSearch` keeps its documented shape (available, model, missing
+    // count, last embedding error).
     app.get('/v1/info', async (_req, res) => {
-      const queueLanes = await collectQueueLaneMetrics(this.graph);
+      // The lanes' `unavailable` flag is probe state; the failure reason is the
+      // driver's raw error text (host, port, topology), which this route's own
+      // comment above calls reconnaissance. /api/health strips the same field
+      // from its lanes for exactly that reason, so the cause stays in the log
+      // the manager already wrote and this response keeps the flag only. The
+      // loopback-only doctor route keeps the reason: its consumer reads it for
+      // the remediation row.
+      const queueLanes = (await collectQueueLaneMetrics(this.graph)).map(
+        ({ unavailableReason: _unavailableReason, ...lane }) => lane,
+      );
+      const vectorSearch = await getVectorSearchStatus(this.graph.postgres.pool).catch((error: unknown) => {
+        // The response stays free of the driver error text (see above); the
+        // cause goes to the server log, where the operator can read it.
+        const err = error instanceof Error ? error : new Error(String(error));
+        logger.warn('SYSTEM', 'Vector search status could not be read for /v1/info', {}, err);
+        return {
+          available: false,
+          model: '',
+          observationsWithoutVectors: null,
+          lastEmbedError: null,
+        };
+      });
       res.json({
         name: 'claude-mem-server',
         runtime: SERVER_RUNTIME,
-        authMode: this.graph.authMode,
         postgres: {
           initialized: this.graph.postgres.bootstrap.initialized,
-          schemaVersion: this.graph.postgres.bootstrap.schemaVersion,
         },
         boundaries: {
-          queueManager: this.graph.queueManager.getHealth(),
-          generationWorkerManager: this.graph.generationWorkerManager.getHealth(),
+          queueManager: { status: this.graph.queueManager.getHealth().status },
+          generationWorkerManager: { status: this.graph.generationWorkerManager.getHealth().status },
         },
         queueLanes,
+        vectorSearch,
       });
     });
   }
@@ -207,12 +239,14 @@ export class ServerService {
       authMode: compatAuthMode,
     }));
 
-    // #2552 — mount the Viewer UI static handler so the viewer loads on the
-    // server runtime. Registered AFTER the /v1 and compat API routes so the
-    // viewer's own API calls resolve against those; express.static only
-    // matches existing files and the `/` GET only matches the root, so this
-    // never shadows an API route.
-    server.registerRoutes(new ServerViewerRoutes());
+    // #2552 — mount the Viewer UI and the worker-shaped read endpoints it
+    // calls. Registered AFTER the /v1 and compat API routes; express.static
+    // only matches existing files and the viewer's own paths do not overlap
+    // /v1 or /api/sessions/*, so this never shadows an API route.
+    server.registerRoutes(new ServerViewerRoutes({
+      pool: this.graph.postgres.pool,
+      authMode: compatAuthMode,
+    }));
 
     server.finalizeRoutes();
 
@@ -243,11 +277,19 @@ export class ServerService {
         }
         this.server = null;
       }
-      await Promise.all([
-        this.graph.queueManager.close(),
-        this.graph.generationWorkerManager.close(),
+      // Each owner must finish releasing its database work before the pool
+      // closes, even if a sibling close fails. Keep the original failure for
+      // the caller, but do not let it skip remaining resource cleanup.
+      const boundaries = await Promise.allSettled([
+        () => this.graph.queueManager.close(),
+        () => this.graph.generationWorkerManager.close(),
+        () => this.graph.stopBackgroundWork?.(),
+      ].map(close => Promise.resolve().then(close)));
+      const pool = await Promise.allSettled([
+        Promise.resolve().then(() => this.graph.postgres.pool.end()),
       ]);
-      await this.graph.postgres.pool.end();
+      const failure = [...boundaries, ...pool].find(result => result.status === 'rejected');
+      if (failure?.status === 'rejected') throw failure.reason;
     } finally {
       if (this.persistRuntimeState) {
         removeServerState();
@@ -527,9 +569,12 @@ export async function runServerApiKeyCli(argv: string[]): Promise<void> {
 
   const { getSharedPostgresPool } = await import('../../storage/postgres/index.js');
   const { PostgresAuthRepository } = await import('../../storage/postgres/auth.js');
-  const { createHash, randomBytes } = await import('crypto');
+  const { ensureApiKeySchema } = await import('../../storage/postgres/schema.js');
+  const { hashApiKey, apiKeyPrefix } = await import('../auth/api-key-hash.js');
+  const { randomBytes } = await import('crypto');
   const pool = getSharedPostgresPool({ requireDatabaseUrl: true });
   const repo = new PostgresAuthRepository(pool);
+  await ensureApiKeySchema(pool);
 
   try {
     if (sub === 'create') {
@@ -551,9 +596,10 @@ export async function runServerApiKeyCli(argv: string[]): Promise<void> {
         projectId = result.projectId;
       }
       const rawKey = `cmem_${randomBytes(24).toString('hex')}`;
-      const keyHash = createHash('sha256').update(rawKey).digest('hex');
+      const keyHash = hashApiKey(rawKey);
       const created = await repo.createApiKey({
         keyHash,
+        keyPrefix: apiKeyPrefix(rawKey),
         teamId,
         projectId,
         scopes,
@@ -850,18 +896,23 @@ function getServerPort(): number {
   if (Number.isInteger(parsed) && parsed > 0) {
     return parsed;
   }
-  // UID-derived default for multi-account isolation: two users on the same
-  // host get distinct ports without explicit configuration. Containerized
-  // deployments always pass CLAUDE_MEM_SERVER_PORT so this branch is local-only.
-  return DEFAULT_SERVER_PORT + ((process.getuid?.() ?? 77) % 100);
+  return getDefaultServerPort(paths.dataDir());
 }
 
 function spawnServerDaemon(port: number): number | undefined {
   const scriptPath = typeof __filename !== 'undefined' ? __filename : fileURLToPath(import.meta.url);
-  const child = spawn(process.execPath, [scriptPath, '--daemon'], {
+  // A cwd that does not exist makes spawn fail with ENOENT, and paths.ts resolves
+  // DATA_DIR without creating it — so create it rather than depend on some earlier
+  // caller having done so. Idempotent.
+  mkdirSync(paths.dataDir(), { recursive: true });
+  // The server's embedder loads sharp; never let Bun auto-install it (#5601).
+  const child = spawn(process.execPath, [BUN_NO_AUTO_INSTALL_FLAG, scriptPath, '--daemon'], {
     detached: true,
     stdio: 'ignore',
     windowsHide: true,
+    // Never the caller's directory: a daemon holds its cwd open for its whole life, and
+    // on Windows that locks the folder against rename or move (#3706).
+    cwd: paths.dataDir(),
     // Strip host CLI bleed-through (CLAUDE_CODE_*, including EFFORT_LEVEL) and
     // Anthropic credentials before handing env to the detached daemon. The
     // daemon re-reads credentials from ~/.claude-mem/.env at SDK spawn time.

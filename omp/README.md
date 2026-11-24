@@ -1,0 +1,149 @@
+# Claude-Mem for OMP (Oh My Pi)
+
+An [OMP](https://omp.sh) hook adapter that records OMP sessions into the same
+claude-mem store that Claude Code, Cursor, and OpenCode already write to —
+one shared memory across all your agents.
+
+OMP loads hook modules from its selected agent directory's `hooks/pre/*.ts` or
+`<cwd>/.omp/hooks/pre/*.ts` (per-project) on every session start. This hook
+translates OMP lifecycle events into claude-mem's REST V1 event shape, so no
+OMP-side plugin or modification is required.
+
+## How it works
+
+| OMP event | Worker endpoint | Server endpoint (`/v1`) | Purpose |
+|---|---|---|---|
+| `session_start` | — | — | Mint the session's `contentSessionId` |
+| `before_agent_start` | `POST /api/sessions/init` | `POST /v1/sessions/start` + `POST /v1/events?generate=false` (`user_prompt`) | Record every user prompt, in order (creates the claude-mem session on the first) |
+| `tool_result` | `POST /api/sessions/observations` | `POST /v1/events` | Record each tool call after its prompt (fire-and-forget; never posts an init) |
+| `context` | `GET /api/context/inject` | `POST /v1/context` | Inject memory from past sessions into the prompt (60s cache) |
+| `session_switch` / `session_branch` | `POST /api/sessions/summarize` | `POST /v1/events` + `POST /v1/sessions/:id/end` | Finalize the previous session after its prompts and observations, then mint a new id |
+| `session_shutdown` | `POST /api/sessions/summarize` | `POST /v1/events` + `POST /v1/sessions/:id/end` | Finalize the session summary |
+
+Behavioral notes (matching the OpenClaw adapter's conventions):
+
+- `contentSessionId` follows the OMP session file: it rotates when OMP moves to
+  another file (`/new`, `/resume`, fork, branch, `/btw`) and on compaction —
+  never per user prompt, so observations stay grouped. A reload of the file
+  that is already open keeps it.
+- All POSTs are fire-and-forget detached chains; the hook never blocks tool
+  dispatch (the extension runner's 30s handler cap is never approached).
+- `memory_*` tool results are skipped to avoid recursion.
+- `tool_response` is capped at 1000 characters; `tool_input` is passed raw.
+- Every worker request times out after 5s, so a hung worker cannot stall the
+  `context` handler that OMP awaits before each model call.
+- A circuit breaker opens for 30s after 3 consecutive worker failures
+  (timeouts count).
+- Runtime selection matches Claude Code's `runtime-selector.ts`: when
+  `CLAUDE_MEM_RUNTIME` is `"server"` (or legacy `"server-beta"`) and
+  `CLAUDE_MEM_SERVER_URL`, `CLAUDE_MEM_SERVER_API_KEY`, and
+  `CLAUDE_MEM_SERVER_PROJECT_ID` (or their legacy `CLAUDE_MEM_SERVER_BETA_*`
+  equivalents) are configured via environment or `settings.json`, the hook
+  speaks `/v1` with `Authorization: Bearer <key>`. Otherwise it falls back to
+  the local worker (`CLAUDE_MEM_WORKER_PORT` / `CLAUDE_MEM_WORKER_HOST`, then
+  `settings.json` in `CLAUDE_MEM_DATA_DIR`, default `~/.claude-mem`, then the
+  per-user default port). Settings are re-read at every OMP session start and
+  session switch.
+- With the worker, the hook never names the project: each request carries the
+  session's `cwd`, and the worker resolves the project key with the same resolver
+  the Claude Code hooks use, so OMP and Claude Code sessions in one checkout share
+  one project. Excluded projects (`CLAUDE_MEM_EXCLUDED_PROJECTS`) are skipped.
+- With the server, nothing passes through the worker, so the hook applies the
+  worker's rules itself (as the Hermes plugin does):
+  - The project key comes from git: the repository's folder name,
+    `<repo>/<worktree>` for a linked worktree, or the folder name outside git.
+    It is sent as `metadata.project` and as the context `folderProjects`, and
+    cached per folder for 5 minutes.
+  - A folder matching `CLAUDE_MEM_EXCLUDED_PROJECTS` (same globs as the worker),
+    or any process with `CLAUDE_MEM_INTERNAL=1`, sends nothing: no session start,
+    events, context request or session end.
+  - Tools listed in `CLAUDE_MEM_SKIP_TOOLS` (comma-separated, any case) are not
+    sent.
+  - A prompt that is wholly `<private>` (or empty) is not recorded, and neither
+    are its tool calls or its closing reply.
+  - `/v1/sessions/start` keeps only the first prompt, so every prompt is also
+    posted as a `user_prompt` event with `generate=false`, which starts no
+    server-side inference.
+- Each prompt's init waits for the previous one, so the worker records prompts
+  in order. A tool result waits for its prompt's init and is dropped when the
+  worker did not record that prompt; one that arrives before any prompt is sent
+  at once.
+- A session is finalized only after the worker recorded one of its prompts.
+- The `context` handler preserves the original conversation and appends one
+  transient `custom` message (`claude-mem:context`), without writing it to session
+  history. OMP drops unsupported `system` conversation messages. It converts
+  `custom` messages to developer content; framing the retrieved history as
+  reference data is not a prompt-injection sandbox.
+- Context requests always retain the current `cwd`. They filter to source `omp`
+  by default; when `CLAUDE_MEM_SESSION_START_INCLUDE_ALL_SOURCES` is `"true"`
+  (or boolean `true` in settings), they omit that source filter so the worker
+  can apply the central cross-host policy. A defined environment value, even
+  empty, takes precedence over `settings.json`. The context cache includes this
+  effective policy, so source-policy changes take effect on the next context
+  callback without waiting for its 60s TTL. This does not broaden the worker's
+  project scope or change capture's `platformSource`.
+
+## Install
+
+Requires a running claude-mem worker (installed via `npx claude-mem install`).
+
+```bash
+npx claude-mem install --ide omp
+```
+
+This copies `omp/hooks/claude-mem.ts` to `~/.omp/agent/hooks/pre/claude-mem.ts`,
+where OMP auto-discovers it for every session. No restart of OMP is needed —
+the hook loads at the next session start.
+
+Install and uninstall follow OMP's active profile: `OMP_PROFILE` takes precedence
+over the legacy `PI_PROFILE`, and a named profile uses
+`~/.omp/profiles/<name>/agent/hooks/pre/claude-mem.ts`. `PI_CONFIG_DIR` changes the
+`.omp` config directory name. In the default profile, `PI_CODING_AGENT_DIR` can
+override the agent directory. Run install and uninstall with the same profile
+environment used to start OMP; an explicitly empty or `default` `OMP_PROFILE`
+selects the default profile.
+
+Manual install (no claude-mem CLI):
+
+```bash
+mkdir -p ~/.omp/agent/hooks/pre
+cp omp/hooks/claude-mem.ts ~/.omp/agent/hooks/pre/claude-mem.ts
+```
+
+## Uninstall
+
+```bash
+npx claude-mem uninstall   # removes the OMP hook along with all other integrations
+```
+
+Or manually:
+
+```bash
+rm ~/.omp/agent/hooks/pre/claude-mem.ts
+```
+
+## Verify
+
+Run a session in OMP, make at least one tool call, then:
+
+```bash
+npx claude-mem search "your project"
+```
+
+Observations from the OMP session appear alongside Claude Code / Cursor
+observations under the same project (platform source `omp`), and
+`~/.claude-mem/claude-mem.db` gains an `sdk_sessions` row with
+`platform_source = 'omp'`.
+
+## Development
+
+The hook is a single self-contained TypeScript module with no runtime
+dependencies (`import type` is erased at load). To test against a live OMP
+installation, copy the file into a project's `.omp/hooks/pre/` and run:
+
+```bash
+omp --print "Use the bash tool to run: pwd. Then finish."
+```
+
+Then confirm the observation landed in claude-mem's database:
+`SELECT * FROM sdk_sessions WHERE platform_source = 'omp';`

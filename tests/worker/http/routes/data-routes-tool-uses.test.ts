@@ -1,25 +1,6 @@
-import { describe, it, expect, mock, beforeEach, afterEach, afterAll, spyOn } from 'bun:test';
+import { describe, it, expect, mock, beforeEach, afterEach, spyOn } from 'bun:test';
 import type { Request, Response } from 'express';
 import { logger } from '../../../../src/utils/logger.js';
-
-// Same module-snapshot dance as data-routes-coercion.test.ts: bun's
-// mock.module is process-global and mock.restore() does not undo it.
-import * as realPaths from '../../../../src/shared/paths.js';
-import * as realWorkerUtils from '../../../../src/shared/worker-utils.js';
-const realPathsSnapshot = { ...realPaths };
-const realWorkerUtilsSnapshot = { ...realWorkerUtils };
-
-mock.module('../../../../src/shared/paths.js', () => ({
-  getPackageRoot: () => '/tmp/test',
-}));
-mock.module('../../../../src/shared/worker-utils.js', () => ({
-  getWorkerPort: () => 37777,
-}));
-
-afterAll(() => {
-  mock.module('../../../../src/shared/paths.js', () => realPathsSnapshot);
-  mock.module('../../../../src/shared/worker-utils.js', () => realWorkerUtilsSnapshot);
-});
 
 import { DataRoutes } from '../../../../src/services/worker/http/routes/DataRoutes.js';
 
@@ -99,12 +80,16 @@ describe('DataRoutes tool_uses (progressive disclosure layer 4)', () => {
     ];
 
     mockGetToolUsesByIds = mock(() => [SAMPLE_ROW]);
-    mockQueryToolUses = mock(() => [SAMPLE_ROW]);
+    mockQueryToolUses = mock(() => [{
+      ...SAMPLE_ROW,
+      tool_input_bytes: Buffer.byteLength(SAMPLE_ROW.tool_input, 'utf8'),
+      tool_response_bytes: Buffer.byteLength(SAMPLE_ROW.tool_response, 'utf8'),
+    }]);
 
     const mockDbManager = {
       getSessionStore: () => ({
         getToolUsesByIds: mockGetToolUsesByIds,
-        queryToolUses: mockQueryToolUses,
+        queryToolUseIndex: mockQueryToolUses,
       }),
     };
 
@@ -169,6 +154,26 @@ describe('DataRoutes tool_uses (progressive disclosure layer 4)', () => {
       expect(jsonSpy).toHaveBeenCalledWith([]);
       expect(mockGetToolUsesByIds).not.toHaveBeenCalled();
     });
+
+    // `limit` only trims what comes back; it does not bound the number of ids
+    // the query looks up. Cap the array as well.
+    it('rejects more than 100 ids', () => {
+      const ids = Array.from({ length: 101 }, (_, i) => i + 1);
+      const { req, res, statusSpy } = createMockReqRes({ ids });
+      handler(req as Request, res as Response);
+
+      expect(statusSpy).toHaveBeenCalledWith(400);
+      expect(mockGetToolUsesByIds).not.toHaveBeenCalled();
+    });
+
+    it('accepts exactly 100 ids', () => {
+      const ids = Array.from({ length: 100 }, (_, i) => i + 1);
+      const { req, res, jsonSpy } = createMockReqRes({ ids });
+      handler(req as Request, res as Response);
+
+      expect(mockGetToolUsesByIds).toHaveBeenCalledWith(ids, expect.anything());
+      expect(jsonSpy).toHaveBeenCalled();
+    });
   });
 
   describe('GET /api/tool-uses', () => {
@@ -217,5 +222,45 @@ describe('DataRoutes tool_uses (progressive disclosure layer 4)', () => {
         toolName: ['Read', 'Edit'],
       }));
     });
+
+    it('passes epoch-ms date bounds through to the store', () => {
+      const { req, res } = createMockReqRes(undefined, { dateStart: '1757203200000', dateEnd: '1757289600000' });
+      handler(req as Request, res as Response);
+
+      expect(mockQueryToolUses).toHaveBeenCalledWith(expect.objectContaining({
+        dateStart: 1757203200000,
+        dateEnd: 1757289600000,
+      }));
+    });
+
+    it('keeps short and decimal epoch-ms bounds as numbers', () => {
+      const { req, res } = createMockReqRes(undefined, { dateStart: '0', dateEnd: '1757289600000.0' });
+      handler(req as Request, res as Response);
+
+      expect(mockQueryToolUses).toHaveBeenCalledWith(expect.objectContaining({
+        dateStart: 0,
+        dateEnd: 1757289600000,
+      }));
+    });
+
+    it('rejects a repeated date bound instead of dropping it', () => {
+      const { req, res, statusSpy, jsonSpy } = createMockReqRes(undefined, { dateStart: ['1757203200000', 'last-week'] });
+      handler(req as Request, res as Response);
+
+      expect(statusSpy).toHaveBeenCalledWith(400);
+      expect((jsonSpy.mock.calls[0] as any[])[0].code).toBe('INVALID_DATE');
+      expect(mockQueryToolUses).not.toHaveBeenCalled();
+    });
+
+    for (const bound of ['dateStart', 'dateEnd']) {
+      it(`rejects a ${bound} that is not a date instead of listing every row`, () => {
+        const { req, res, statusSpy, jsonSpy } = createMockReqRes(undefined, { [bound]: 'last-week' });
+        handler(req as Request, res as Response);
+
+        expect(statusSpy).toHaveBeenCalledWith(400);
+        expect((jsonSpy.mock.calls[0] as any[])[0].code).toBe('INVALID_DATE');
+        expect(mockQueryToolUses).not.toHaveBeenCalled();
+      });
+    }
   });
 });
